@@ -1,25 +1,41 @@
 """
-Groth16 Part 1 — RareSkills Homework 11 (Week 13)
+Groth16 (FULL) — RareSkills Homework 12 (Week 13)
 ===================================================
-Implements the Groth16 proving system end-to-end:
+Implements the COMPLETE Groth16 proving system end-to-end:
   R1CS -> QAP -> Trusted Setup (multi-party) -> Prover -> Verifier
+
+This upgrades the Part 1 implementation to include:
+  * gamma (gamma) — separates verifier's public-input term
+  * delta (delta) — separates prover's private-input + H(t)/T term
+  * r, s          — prover's per-proof randomness (zero-knowledge blinding)
+  * Public/private witness split (first `num_public` columns are public)
+
+Reference: https://www.rareskills.io/post/groth16 (formulas at the end)
 
 Communication flow:
   1. QAP is derived from the public circuit (R1CS).
-  2. Trusted Setup Ceremony (multi-party Powers of Tau):
-       Alice ---tau_1---> [SRS] ---tau_2---> Bob ---tau_3---> [SRS]
-       (deletes tau_1)              (deletes tau_2)              (deletes tau_3)
-     Then a coordinator adds alpha, beta for the circuit, then deletes them.
+  2. Trusted Setup Ceremony:
+       Phase 1 (multi-party Powers of Tau):
+         Alice ---tau_1---> [SRS] ---tau_2---> Bob ---tau_3---> [SRS]
+         (deletes tau_1)              (deletes tau_2)              (deletes tau_3)
+       Phase 2 (coordinator):
+         Generates alpha, beta, gamma, delta, computes circuit-specific
+         SRS elements (eta, Psi_public, Psi_private), then DESTROYS all four.
      Result: public SRS (only EC points — all scalars destroyed).
   3. Prover receives: SRS + witness (private).
+     Prover picks fresh random r, s (destroyed after use).
      Prover computes proof = (A1, B2, C1) and sends it to Verifier.
-  4. Verifier receives: SRS + proof (does NOT know the witness).
-     Verifier checks: e(-A, B) * e(alpha, beta) * e(C, G2) = I_12.
+  4. Verifier receives: SRS + proof + the PUBLIC part of the witness.
+     Verifier does NOT see the private witness.
+     Verifier checks:
+       e(-[A]1, [B]2) * e([alpha]1, [beta]2) * e([X]1, [gamma]2) * e([C]1, [delta]2) = I_12
+     where [X]1 = sum_{i in public} a_i * Psi_public_i.
 
 Features:
   - Dynamic R1CS: user-provided or default (out = 3x^2*y + 5xy - x - 2y + 3)
   - Two Lagrange interpolation modes: manual (from scratch) and library (galois)
-  - Multi-party trusted setup demonstrating Powers of Tau security
+  - Multi-party trusted setup (Phase 1) demonstrating Powers of Tau security
+  - Public/private input separation via gamma / delta
 
 Usage:
   python groth16.py
@@ -459,6 +475,8 @@ class TrustedSetup:
     """
     Groth16 Trusted Setup Ceremony — orchestrates the multi-party process.
 
+    Reference: https://www.rareskills.io/post/groth16
+
     Two phases:
 
     PHASE 1 — Powers of Tau (multi-party, circuit-independent):
@@ -468,30 +486,49 @@ class TrustedSetup:
       tau = prod(tau_i), unknown to anyone.
 
     PHASE 2 — Circuit-Specific (single coordinator):
-      A coordinator generates alpha, beta and computes the circuit-specific
-      SRS elements (eta, Psi) using the Phase 1 output + QAP polynomials.
+      Coordinator generates alpha, beta, gamma, delta (all secrets) and
+      computes the circuit-specific SRS using Phase 1 output + QAP polys.
       The coordinator does NOT know tau — they compute everything via inner
-      products with the SRS points from Phase 1.
-      After computing, the coordinator destroys alpha, beta.
+      products with the Phase 1 points. They DO know alpha/beta/gamma/delta
+      while setting up, then destroy all four.
+
+      The public/private witness split is baked into Psi here:
+        Psi_public_i  = [(beta*u_i(tau) + alpha*v_i(tau) + w_i(tau)) / gamma]_1
+                        for i in [0, num_public)
+        Psi_private_i = [(beta*u_i(tau) + alpha*v_i(tau) + w_i(tau)) / delta]_1
+                        for i in [num_public, m)
+
+      eta (H(tau)*t(tau) term) also divides by delta:
+        eta_j = [tau^j * t(tau) / delta]_1  for j in [0, n-1)
 
     Published SRS (all EC points — no raw scalars):
-      srs1, srs2, eta, [alpha]1, [beta]2, Psi
+      srs1, srs2, eta, [alpha]_1, [beta]_1, [beta]_2,
+      [gamma]_2, [delta]_1, [delta]_2, psi_public, psi_private
     """
 
-    def __init__(self, qap, participant_names=None):
+    def __init__(self, qap, num_public, participant_names=None):
+        # UPGRADE: TrustedSetup now requires `num_public` so it can split the
+        # Psi vector into public-side (divided by gamma) and private-side
+        # (divided by delta) during Phase 2.
         self.qap = qap
+        self.num_public = num_public  # ell: first `num_public` witness columns are public
         if participant_names is None:
             participant_names = ["Alice", "Bob", "Charlie"]
         self.participant_names = participant_names
 
     def run_ceremony(self):
         """Execute the full trusted setup and return the public SRS."""
-        n = self.qap.n  # number of constraints
-        m = self.qap.m  # number of columns
+        n = self.qap.n      # number of constraints
+        m = self.qap.m      # number of columns
+        ell = self.num_public
+
+        assert 0 < ell <= m, f"num_public must be in (0, {m}], got {ell}"
 
         print(f"\n{'='*60}")
-        print(f"  TRUSTED SETUP CEREMONY")
+        print(f"  TRUSTED SETUP CEREMONY (FULL GROTH16)")
         print(f"{'='*60}")
+        print(f"  Public inputs: witness[0:{ell}]  (shared with verifier)")
+        print(f"  Private inputs: witness[{ell}:{m}]  (known only to prover)")
 
         # ============================================
         # PHASE 1: Powers of Tau (multi-party)
@@ -502,13 +539,11 @@ class TrustedSetup:
         print(f"  Security: as long as ONE participant deletes their secret,")
         print(f"  the combined tau is unknown to everyone.\n")
 
-        # We need 2n-1 G1 powers for eta computation (not just n).
-        # eta_j = sum_k T_coeffs[k] * tau^{j+k} * G1, and the highest
-        # index is (n-2) + n = 2n-2, so we need powers 0 through 2n-2.
+        # Need 2n-1 G1 powers (for eta computation up to tau^(2n-2)).
+        # Need n G2 powers (for V(tau) evaluation by the prover).
         n_g1_powers = 2 * n - 1
-        n_g2_powers = n  # prover only needs n G2 powers for V(x)
+        n_g2_powers = n
 
-        # Initialize: all generators (tau^i = 1^i = 1 before any contribution)
         powers_g1 = [G1] * n_g1_powers
         powers_g2 = [G2] * n_g2_powers
 
@@ -536,36 +571,51 @@ class TrustedSetup:
         # ============================================
         print(f"  PHASE 2: Circuit-Specific Setup (coordinator)")
         print(f"  {'-'*50}")
-        print(f"  The coordinator generates alpha, beta and computes circuit")
-        print(f"  elements. The coordinator does NOT know tau — they only see")
-        print(f"  the EC points from Phase 1 and compute via inner products.\n")
+        print(f"  Coordinator generates alpha, beta, gamma, delta and computes")
+        print(f"  circuit elements using Phase 1 EC points + QAP polynomials.")
+        print(f"  The coordinator does NOT know tau.\n")
 
-        # Coordinator generates circuit-specific toxic waste
+        # UPGRADE: full Groth16 needs FOUR circuit-level secrets (Part 1 only
+        # had alpha, beta). gamma gates the public-input side of the SRS;
+        # delta gates the private-input side plus the H(tau)*t(tau) term and
+        # the prover's blinding. All four must be destroyed after setup.
         alpha = secrets.randbelow(p - 1) + 1
-        beta = secrets.randbelow(p - 1) + 1
+        beta  = secrets.randbelow(p - 1) + 1
+        gamma = secrets.randbelow(p - 1) + 1   # UPGRADE: new
+        delta = secrets.randbelow(p - 1) + 1   # UPGRADE: new
+        gamma_inv = f_inv(gamma)               # UPGRADE: used to divide Psi_public
+        delta_inv = f_inv(delta)               # UPGRADE: used to divide Psi_private and eta
         print(f"  Coordinator: Generated alpha = {alpha}")
-        print(f"  Coordinator: Generated beta  = {beta}\n")
+        print(f"  Coordinator: Generated beta  = {beta}")
+        print(f"  Coordinator: Generated gamma = {gamma}")
+        print(f"  Coordinator: Generated delta = {delta}\n")
 
-        # srs1 = first n G1 powers (for the prover's U, V evaluations)
+        # Raw tau powers the prover will use directly.
         srs1 = powers_g1[:n]
         srs2 = powers_g2[:n]
 
-        # [alpha]1 = alpha * G1,  [beta]2 = beta * G2
+        # Scalar * generator elements
+        # UPGRADE: [beta]_1, [gamma]_2, [delta]_1, [delta]_2 are all new in the
+        # full protocol. The prover needs [beta]_1 and [delta]_1 to build
+        # [B]_1 and the blinding terms in [C]_1; the verifier needs [gamma]_2
+        # and [delta]_2 for the 4-pairing check.
         alpha_G1 = multiply(G1, alpha)
-        beta_G2 = multiply(G2, beta)
+        beta_G1  = multiply(G1, beta)     # UPGRADE: needed by prover for [B]_1
+        beta_G2  = multiply(G2, beta)
+        gamma_G2 = multiply(G2, gamma)    # UPGRADE: verifier pairs against [X]_1
+        delta_G1 = multiply(G1, delta)    # UPGRADE: prover's blinding and -rs*[delta]_1 term
+        delta_G2 = multiply(G2, delta)    # UPGRADE: verifier pairs against [C]_1
 
-        # ---- Compute eta WITHOUT knowing tau ----
-        # eta_j = tau^j * t(tau) * G1 = sum_k T_coeffs[k] * powers_g1[j + k]
-        #
-        # T(x) has degree n, so T_coeffs has n+1 elements.
-        # For j = 0..n-2, the highest index is (n-2) + n = 2n-2,
-        # which is why we produced 2n-1 G1 powers in Phase 1.
-        #
-        # The coordinator only knows the T(x) coefficients (public, derived
-        # from the circuit) and the G1 powers (from Phase 1). They never
-        # learn tau itself — this is the beauty of the SRS approach.
+        # ---- eta: [tau^j * t(tau) / delta]_1 for j = 0..n-2 ----
+        # UPGRADE: divide each eta entry by delta. In Part 1 this was just
+        # tau^j * t(tau) * G1. The /delta factor is what forces H(tau)*t(tau)
+        # to always appear inside [C]_1 (whose pairing partner is [delta]_2),
+        # so the factor cancels out in the final verification equation.
+        # Compute tau^j * t(tau) * G1 via inner products with T_coeffs and
+        # Phase 1 G1 powers (the coordinator never learns tau). Then scale
+        # by delta_inv (the coordinator knows delta).
         print(f"  Coordinator: Computing eta ({n-1} G1 points)...")
-        print(f"    eta_j = sum_k T_coeffs[k] * [tau^(j+k)]_1  (no tau knowledge needed!)")
+        print(f"    eta_j = delta_inv * sum_k T_coeffs[k] * [tau^(j+k)]_1")
         T_coeffs = self.qap.T
         eta = []
         for j in range(n - 1):
@@ -576,58 +626,93 @@ class TrustedSetup:
                     continue
                 term = multiply(powers_g1[j + k], t_k)
                 point = term if point is None else add(point, term)
+            # UPGRADE: Divide-by-delta (coordinator knows delta, multiplies by its inverse)
+            if point is not None:
+                point = multiply(point, delta_inv)
             eta.append(point)
 
-        # ---- Compute Psi WITHOUT knowing tau ----
-        # Psi_i = (w_i(tau) + alpha * v_i(tau) + beta * u_i(tau)) * G1
+        # ---- Psi_public and Psi_private ----
+        # UPGRADE: Part 1 had a single `psi` list that the prover combined
+        # with the ENTIRE witness inside [C]_1. That made the scheme not
+        # zero-knowledge across public inputs — anyone seeing the proof and
+        # the SRS could recompute Psi_i * a_i and check equalities.
         #
-        # Each polynomial evaluation at tau is an inner product with srs1:
-        #   w_i(tau) * G1 = <w_i_coeffs, srs1>
-        # The coordinator knows alpha, beta (their own secrets) and the
-        # polynomial coefficients (public, from QAP). They multiply the
-        # EC points by alpha and beta — STILL never learning tau.
-        print(f"  Coordinator: Computing Psi ({m} G1 points)...")
-        print(f"    Psi_i = <w_i, srs1> + alpha * <v_i, srs1> + beta * <u_i, srs1>")
-        psi = []
+        # Full Groth16 SPLITS Psi in two:
+        #   Psi_public_i  = C_i(tau) / gamma * G1   (public: i < ell)
+        #   Psi_private_i = C_i(tau) / delta * G1   (private: i >= ell)
+        # where C_i(tau) = w_i(tau) + alpha*v_i(tau) + beta*u_i(tau).
+        # The /gamma and /delta factors cancel out against [gamma]_2 and
+        # [delta]_2 at verification. Verifier uses Psi_public; prover uses
+        # Psi_private.
+        print(f"  Coordinator: Computing Psi ({ell} public + {m - ell} private G1 points)...")
+        print(f"    C_i(tau) = w_i(tau) + alpha*v_i(tau) + beta*u_i(tau)")
+        print(f"    Psi_public_i  = C_i(tau) * gamma_inv   (i < {ell})")
+        print(f"    Psi_private_i = C_i(tau) * delta_inv   (i >= {ell})")
+        psi_public = []
+        psi_private = []
         for i in range(m):
-            # Evaluate each column polynomial at tau via inner product with SRS
+            # Evaluate u_i, v_i, w_i at tau via inner products with srs1.
             w_c = list(self.qap.W_polys[i]) + [0] * max(0, n - len(self.qap.W_polys[i]))
             v_c = list(self.qap.V_polys[i]) + [0] * max(0, n - len(self.qap.V_polys[i]))
             u_c = list(self.qap.U_polys[i]) + [0] * max(0, n - len(self.qap.U_polys[i]))
 
-            w_point = inner_product_ec(w_c[:n], srs1)          # w_i(tau) * G1
-            v_point = inner_product_ec(v_c[:n], srs1)          # v_i(tau) * G1
-            u_point = inner_product_ec(u_c[:n], srs1)          # u_i(tau) * G1
+            w_point = inner_product_ec(w_c[:n], srs1)   # w_i(tau) * G1
+            v_point = inner_product_ec(v_c[:n], srs1)   # v_i(tau) * G1
+            u_point = inner_product_ec(u_c[:n], srs1)   # u_i(tau) * G1
 
-            # Coordinator multiplies by their alpha, beta (scalars they know)
             alpha_v = multiply(v_point, alpha) if v_point is not None else None
-            beta_u = multiply(u_point, beta) if u_point is not None else None
+            beta_u  = multiply(u_point, beta)  if u_point is not None else None
 
-            # Psi_i = w_i(tau)*G1 + alpha*v_i(tau)*G1 + beta*u_i(tau)*G1
-            psi_i = w_point
+            combined = w_point
             if alpha_v is not None:
-                psi_i = add(psi_i, alpha_v)
+                combined = alpha_v if combined is None else add(combined, alpha_v)
             if beta_u is not None:
-                psi_i = add(psi_i, beta_u)
+                combined = beta_u if combined is None else add(combined, beta_u)
 
-            psi.append(psi_i)
+            if i < ell:
+                # UPGRADE: public columns get divided by gamma.
+                scaled = multiply(combined, gamma_inv) if combined is not None else None
+                psi_public.append(scaled)
+            else:
+                # UPGRADE: private columns get divided by delta.
+                scaled = multiply(combined, delta_inv) if combined is not None else None
+                psi_private.append(scaled)
 
         # ---- DESTROY circuit-specific toxic waste ----
-        print(f"\n  Coordinator: DESTROYING alpha and beta...")
+        # UPGRADE: we now destroy gamma and delta in addition to alpha, beta.
+        # Knowing any of these four would let an attacker forge proofs.
+        print(f"\n  Coordinator: DESTROYING alpha, beta, gamma, delta (and their inverses)...")
         print(f"    alpha = {alpha}  -->  None")
-        print(f"    beta  = {beta}  -->  None")
+        print(f"    beta  = {beta}   -->  None")
+        print(f"    gamma = {gamma}  -->  None")
+        print(f"    delta = {delta}  -->  None")
         alpha = None
         beta = None
-        print(f"  Coordinator: alpha, beta destroyed. Nobody knows them now.\n")
+        gamma = None
+        delta = None
+        gamma_inv = None
+        delta_inv = None
+        print(f"  Coordinator: all Phase-2 secrets destroyed.\n")
 
         # ---- Assemble final public SRS ----
+        # UPGRADE: the SRS now carries four new EC elements plus a split Psi:
+        #   Part 1 keys   -> {srs1, srs2, eta, alpha_G1, beta_G2, psi}
+        #   Full Groth16  -> {srs1, srs2, eta, alpha_G1, beta_G1, beta_G2,
+        #                     gamma_G2, delta_G1, delta_G2,
+        #                     psi_public, psi_private, num_public}
         srs = {
             'srs1': srs1,
             'srs2': srs2,
             'eta': eta,
             'alpha_G1': alpha_G1,
+            'beta_G1': beta_G1,              # UPGRADE
             'beta_G2': beta_G2,
-            'psi': psi,
+            'gamma_G2': gamma_G2,            # UPGRADE
+            'delta_G1': delta_G1,            # UPGRADE
+            'delta_G2': delta_G2,            # UPGRADE
+            'psi_public': psi_public,        # UPGRADE: was merged `psi` in Part 1
+            'psi_private': psi_private,      # UPGRADE: was merged `psi` in Part 1
+            'num_public': ell,               # UPGRADE: ell boundary
         }
 
         print(f"  {'='*50}")
@@ -642,19 +727,27 @@ class TrustedSetup:
         for i, pt in enumerate(srs2):
             print(f"      tau^{i}*G2 = {point_str(pt)}")
 
-        print(f"\n    eta ({n-1} G1 points) = [t(tau)*G1, ..., tau^{n-2}*t(tau)*G1]:")
+        print(f"\n    eta ({n-1} G1 points) = [tau^j * t(tau) / delta * G1]:")
         for j, pt in enumerate(eta):
-            print(f"      tau^{j}*t(tau)*G1 = {point_str(pt)}")
+            print(f"      eta_{j} = {point_str(pt)}")
 
-        print(f"\n    [alpha]1 = alpha*G1 = {point_str(alpha_G1)}")
-        print(f"    [beta]2  = beta*G2  = {point_str(beta_G2)}")
+        print(f"\n    [alpha]1 = {point_str(alpha_G1)}")
+        print(f"    [beta]1  = {point_str(beta_G1)}")
+        print(f"    [beta]2  = {point_str(beta_G2)}")
+        print(f"    [gamma]2 = {point_str(gamma_G2)}")
+        print(f"    [delta]1 = {point_str(delta_G1)}")
+        print(f"    [delta]2 = {point_str(delta_G2)}")
 
-        print(f"\n    Psi ({m} G1 points) = (w_i(tau) + alpha*v_i(tau) + beta*u_i(tau))*G1:")
-        for i, pt in enumerate(psi):
-            print(f"      Psi_{i} = {point_str(pt)}")
+        print(f"\n    Psi_public ({len(psi_public)} G1 points, divided by gamma):")
+        for i, pt in enumerate(psi_public):
+            print(f"      Psi_public_{i} = {point_str(pt)}")
 
-        print(f"\n  ALL toxic waste destroyed. Nobody knows tau, alpha, or beta.")
-        print(f"  The SRS can be used by any prover/verifier for this circuit.")
+        print(f"\n    Psi_private ({len(psi_private)} G1 points, divided by delta):")
+        for i, pt in enumerate(psi_private):
+            print(f"      Psi_private_{i + ell} = {point_str(pt)}")
+
+        print(f"\n  ALL toxic waste destroyed.")
+        print(f"  Nobody knows tau, alpha, beta, gamma, or delta.")
 
         return srs
 
@@ -681,13 +774,20 @@ class Prover:
     """
     Groth16 Prover — generates a proof of knowledge without revealing the witness.
 
-    Proof consists of 3 EC points:
-      [A]1 = [alpha]1 + <U_coeffs, srs1>           (G1 point)
-      [B]2 = [beta]2  + <V_coeffs, srs2>            (G2 point)
-      [C]1 = sum(a_i * Psi_i) + <H_coeffs, eta>     (G1 point)
+    Reference: https://www.rareskills.io/post/groth16
 
-    The inner products evaluate polynomials at the hidden tau:
-      <U_coeffs, srs1> = U(tau) * G1  (without knowing tau!)
+    UPGRADE (vs Part 1): the prover now picks fresh random r, s for every proof.
+    These scalars blind the proof so that two proofs of the same statement look
+    independent (zero-knowledge + re-randomization). They are destroyed after use.
+
+    Proof (3 EC points):
+      [A]_1 = [alpha]_1 + [U(tau)]_1 + r*[delta]_1                  (G1)
+      [B]_2 = [beta]_2  + [V(tau)]_2 + s*[delta]_2                  (G2)
+      [C]_1 = sum_{i in private} a_i * Psi_private_i
+              + <H, eta>
+              + s*[A]_1 + r*[B]_1 - r*s*[delta]_1                   (G1)
+    where [B]_1 is a prover-internal recomputation of B on G1:
+      [B]_1 = [beta]_1 + [V(tau)]_1 + s*[delta]_1
     """
 
     def __init__(self, qap):
@@ -697,57 +797,98 @@ class Prover:
         """Compute the Groth16 proof and return it for the Verifier."""
         n, m = self.qap.n, self.qap.m
         witness = self.qap.witness
+        ell = srs['num_public']
 
         print(f"\n{'='*60}")
         print(f"  PROVER")
         print(f"{'='*60}")
         print(f"  Prover has the witness (private): {witness}")
         print(f"  Prover has the public SRS from the ceremony.")
-        print(f"  Prover does NOT know tau, alpha, or beta.\n")
+        print(f"  Prover does NOT know tau, alpha, beta, gamma, or delta.\n")
+
+        # UPGRADE: prover samples fresh blinding scalars r, s per proof.
+        # These hide U(tau) and V(tau) behind random multiples of delta,
+        # giving Groth16 its zero-knowledge property.
+        r = secrets.randbelow(p - 1) + 1
+        s = secrets.randbelow(p - 1) + 1
+        print(f"  Prover: sampled fresh r = {r}")
+        print(f"  Prover: sampled fresh s = {s}\n")
 
         # Pad polynomial coefficients to match SRS sizes
         U_coeffs = list(self.qap.U) + [0] * max(0, n - len(self.qap.U))
         V_coeffs = list(self.qap.V) + [0] * max(0, n - len(self.qap.V))
         H_coeffs = list(self.qap.H) + [0] * max(0, (n - 1) - len(self.qap.H))
 
-        # [A]1 = [alpha]1 + <U_coeffs, srs1>
-        # This evaluates to (alpha + U(tau)) * G1 — we never learn alpha or tau.
-        print(f"  Step 1: [A]1 = [alpha]1 + <U_coeffs, srs1>")
-        U_eval = inner_product_ec(U_coeffs[:n], srs['srs1'])
-        A1 = add(srs['alpha_G1'], U_eval)
-        print(f"    <U_coeffs, srs1> = U(tau)*G1 = {point_str(U_eval)}")
-        print(f"    [alpha]1                      = {point_str(srs['alpha_G1'])}")
-        print(f"    [A]1 = [alpha]1 + U(tau)*G1   = {point_str(A1)}")
+        # ---- Step 1: [A]_1 = [alpha]_1 + [U(tau)]_1 + r*[delta]_1 ----
+        # UPGRADE: added the r*[delta]_1 blinding term.
+        print(f"  Step 1: [A]_1 = [alpha]_1 + [U(tau)]_1 + r*[delta]_1")
+        U_eval_G1 = inner_product_ec(U_coeffs[:n], srs['srs1'])
+        r_delta_G1 = multiply(srs['delta_G1'], r)
+        A1 = add(add(srs['alpha_G1'], U_eval_G1), r_delta_G1)
+        print(f"    [U(tau)]_1     = {point_str(U_eval_G1)}")
+        print(f"    [alpha]_1      = {point_str(srs['alpha_G1'])}")
+        print(f"    r*[delta]_1    = {point_str(r_delta_G1)}")
+        print(f"    [A]_1          = {point_str(A1)}")
 
-        # [B]2 = [beta]2 + <V_coeffs, srs2>
-        # This evaluates to (beta + V(tau)) * G2.
-        print(f"\n  Step 2: [B]2 = [beta]2 + <V_coeffs, srs2>")
-        V_eval = inner_product_ec(V_coeffs[:n], srs['srs2'], identity=Z2)
-        B2 = add(srs['beta_G2'], V_eval)
-        print(f"    <V_coeffs, srs2> = V(tau)*G2 = {point_str(V_eval)}")
-        print(f"    [beta]2                       = {point_str(srs['beta_G2'])}")
-        print(f"    [B]2 = [beta]2 + V(tau)*G2    = {point_str(B2)}")
+        # ---- Step 2: [B]_2 = [beta]_2 + [V(tau)]_2 + s*[delta]_2 ----
+        # UPGRADE: added the s*[delta]_2 blinding term.
+        print(f"\n  Step 2: [B]_2 = [beta]_2 + [V(tau)]_2 + s*[delta]_2")
+        V_eval_G2 = inner_product_ec(V_coeffs[:n], srs['srs2'], identity=Z2)
+        s_delta_G2 = multiply(srs['delta_G2'], s)
+        B2 = add(add(srs['beta_G2'], V_eval_G2), s_delta_G2)
+        print(f"    [V(tau)]_2     = {point_str(V_eval_G2)}")
+        print(f"    [beta]_2       = {point_str(srs['beta_G2'])}")
+        print(f"    s*[delta]_2    = {point_str(s_delta_G2)}")
+        print(f"    [B]_2          = {point_str(B2)}")
 
-        # [C]1 = sum(a_i * Psi_i) + <H_coeffs, eta>
-        # Psi_i already has alpha*v_i(tau) + beta*u_i(tau) + w_i(tau) baked in,
-        # so summing a_i*Psi_i gives (W(tau) + alpha*V(tau) + beta*U(tau)) * G1.
-        # The eta inner product adds H(tau)*t(tau) * G1.
-        print(f"\n  Step 3: [C]1 = sum(a_i * Psi_i) + <H_coeffs, eta>")
-        w_scalars = [int(witness[i]) % p for i in range(m)]
-        C1_psi = inner_product_ec(w_scalars, srs['psi'])
-        C1_ht = inner_product_ec(H_coeffs[:n - 1], srs['eta'])
-        C1 = add(C1_psi, C1_ht)
-        print(f"    sum(a_i * Psi_i) = {point_str(C1_psi)}")
-        print(f"    <H_coeffs, eta>  = H(tau)*t(tau)*G1 = {point_str(C1_ht)}")
-        print(f"    [C]1 = sum + H(tau)*t(tau)*G1       = {point_str(C1)}")
+        # ---- Step 3: [B]_1 (prover-internal) for use inside [C]_1 ----
+        # UPGRADE: full Groth16 needs a G1 version of B for the r*[B]_1 term
+        # in [C]_1. Same structure as [B]_2 but in G1.
+        print(f"\n  Step 3: [B]_1 = [beta]_1 + [V(tau)]_1 + s*[delta]_1  (prover-internal)")
+        V_eval_G1 = inner_product_ec(V_coeffs[:n], srs['srs1'])
+        s_delta_G1 = multiply(srs['delta_G1'], s)
+        B1 = add(add(srs['beta_G1'], V_eval_G1), s_delta_G1)
+        print(f"    [B]_1          = {point_str(B1)}")
+
+        # ---- Step 4: [C]_1 ----
+        # UPGRADE: only the PRIVATE part of the witness goes into C.
+        # The public part is re-built by the verifier (via Psi_public).
+        # UPGRADE: added s*[A]_1 + r*[B]_1 - r*s*[delta]_1 blinding terms.
+        print(f"\n  Step 4: [C]_1 = sum_priv a_i * Psi_private_i + <H,eta>")
+        print(f"                   + s*[A]_1 + r*[B]_1 - r*s*[delta]_1")
+        priv_scalars = [int(witness[i]) % p for i in range(ell, m)]
+        C1_psi = inner_product_ec(priv_scalars, srs['psi_private'])
+        C1_ht  = inner_product_ec(H_coeffs[:n - 1], srs['eta'])
+        sA     = multiply(A1, s)
+        rB     = multiply(B1, r)
+        rs     = f_mul(r, s)
+        neg_rs_delta = neg(multiply(srs['delta_G1'], rs))
+
+        C1 = C1_psi
+        C1 = C1_ht if C1 is None else add(C1, C1_ht)
+        C1 = sA    if C1 is None else add(C1, sA)
+        C1 = rB    if C1 is None else add(C1, rB)
+        C1 = neg_rs_delta if C1 is None else add(C1, neg_rs_delta)
+
+        print(f"    sum_priv a_i * Psi_private_i = {point_str(C1_psi)}")
+        print(f"    <H, eta>       = [H(tau)*t(tau)/delta]_1 = {point_str(C1_ht)}")
+        print(f"    s*[A]_1        = {point_str(sA)}")
+        print(f"    r*[B]_1        = {point_str(rB)}")
+        print(f"    -r*s*[delta]_1 = {point_str(neg_rs_delta)}")
+        print(f"    [C]_1          = {point_str(C1)}")
+
+        # UPGRADE: destroy r, s after use (one-time blinding).
+        print(f"\n  Prover: DESTROYING r and s (one-time randomness)...")
+        r = None
+        s = None
 
         proof = {'A1': A1, 'B2': B2, 'C1': C1}
 
         print(f"\n  Final proof (3 EC points):")
-        print(f"    [A]1 = {point_str(A1)}")
-        print(f"    [B]2 = {point_str(B2)}")
-        print(f"    [C]1 = {point_str(C1)}")
-        print(f"\n  >>> Prover sends proof = ([A]1, [B]2, [C]1) to the Verifier >>>")
+        print(f"    [A]_1 = {point_str(A1)}")
+        print(f"    [B]_2 = {point_str(B2)}")
+        print(f"    [C]_1 = {point_str(C1)}")
+        print(f"\n  >>> Prover sends proof = ([A]_1, [B]_2, [C]_1) to the Verifier >>>")
 
         return proof
 
@@ -779,36 +920,59 @@ class Prover:
 
 class Verifier:
     """
-    Groth16 Verifier — checks the proof without learning the witness.
+    Groth16 Verifier — checks the proof without learning the private witness.
 
-    Only needs the proof (3 EC points) and the SRS (public parameters).
-    Performs a single pairing check (3 pairings combined).
+    Reference: https://www.rareskills.io/post/groth16
+
+    UPGRADE (vs Part 1): the verifier now consumes the PUBLIC part of the
+    witness (witness[:num_public]) to rebuild [X]_1 from Psi_public, and runs
+    a 4-pairing equation instead of 3.
+
+    Pairing check:
+      e(-[A]_1, [B]_2) * e([alpha]_1, [beta]_2)
+        * e([X]_1, [gamma]_2) * e([C]_1, [delta]_2) = 1
+    where
+      [X]_1 = sum_{i in public} a_i * Psi_public_i.
+
+    Only needs the proof (3 EC points), the SRS, and the public inputs.
     """
 
-    def verify(self, proof, srs):
+    def verify(self, proof, srs, public_inputs):
         """
         Check the Groth16 pairing equation.
 
-        e(-[A]1, [B]2) * e([alpha]1, [beta]2) * e([C]1, G2) =? I_12
-
-        If this holds, the Prover knows a valid witness (with overwhelming
-        probability). If not, the proof is invalid/forged.
+        If it holds, the Prover knew a valid witness whose public part matches
+        `public_inputs` (with overwhelming probability under SDH assumptions).
         """
         A1 = proof['A1']
         B2 = proof['B2']
         C1 = proof['C1']
-        alpha_G1 = srs['alpha_G1']
-        beta_G2 = srs['beta_G2']
+        ell = srs['num_public']
+        assert len(public_inputs) == ell, \
+            f"Verifier expected {ell} public inputs, got {len(public_inputs)}"
 
         print(f"\n{'='*60}")
         print(f"  VERIFIER")
         print(f"{'='*60}")
-        print(f"  Verifier received proof = ([A]1, [B]2, [C]1) from Prover.")
+        print(f"  Verifier received proof = ([A]_1, [B]_2, [C]_1) from Prover.")
         print(f"  Verifier has the public SRS from the ceremony.")
-        print(f"  Verifier does NOT know the witness, tau, alpha, or beta.\n")
-        print(f"  Checking pairing equation:")
-        print(f"    e(-[A]1, [B]2) * e([alpha]1, [beta]2) * e([C]1, G2) =? I_12\n")
-        print(f"  Computing 3 pairings...")
+        print(f"  Verifier has the public inputs: {list(public_inputs)}")
+        print(f"  Verifier does NOT know the private witness, tau, alpha, beta, gamma, delta.\n")
+
+        # UPGRADE: build [X]_1 from public inputs + Psi_public.
+        # [X]_1 = sum_{i<ell} a_i * Psi_public_i
+        #       = sum_{i<ell} a_i * [(beta*u_i(tau) + alpha*v_i(tau) + w_i(tau)) / gamma]_1
+        # Pairing with [gamma]_2 cancels the gamma, recovering the public part
+        # of W(tau) + alpha*V(tau) + beta*U(tau) in the exponent.
+        print(f"  Step 1: [X]_1 = sum_{{i<{ell}}} a_i * Psi_public_i")
+        pub_scalars = [int(public_inputs[i]) % p for i in range(ell)]
+        X1 = inner_product_ec(pub_scalars, srs['psi_public'])
+        print(f"    [X]_1 = {point_str(X1)}\n")
+
+        print(f"  Step 2: check pairing equation")
+        print(f"    e(-[A]_1, [B]_2) * e([alpha]_1, [beta]_2)")
+        print(f"      * e([X]_1, [gamma]_2) * e([C]_1, [delta]_2) =? I_12\n")
+        print(f"  Computing 4 pairings...")
 
         # --- About pairing and final_exponentiate ---
         #
@@ -817,43 +981,24 @@ class Verifier:
         #   - Final exponentiation: Chapter 7, Section 7.5 (p.113)
         #   - Background (Weil/Tate pairings): Sections 5.1-5.2 (pp.69-74)
         #
-        # A pairing e(P, Q) maps G1 x G2 -> GT, computed in two stages:
-        #
-        # 1. Miller loop: produces a "raw" element in F_{p^12}* (the full
-        #    multiplicative group of the degree-12 extension field). This raw
-        #    value is NOT unique — many raw values represent the same pairing.
-        #
-        # 2. Final exponentiation: raises the result to (p^12 - 1) / r, which
-        #    projects it into GT, the unique order-r subgroup of F_{p^12}*.
-        #    After this, the result is canonical (one value per pairing).
-        #    Think of it like reducing a fraction to lowest terms: 2/4 and 3/6
-        #    look different, but after normalization both become 1/2.
-        #
-        # py_ecc's pairing() already includes both stages internally.
-        # When checking e(P1,Q1) * e(P2,Q2) * e(P3,Q3) = 1, the ideal
-        # approach is: compute only Miller loops, multiply the raw results,
-        # then final_exponentiate ONCE (saving 2 expensive exponentiations).
-        #
-        # Here we use pairing() (which already final-exponentiates each term)
-        # then final_exponentiate the product again. This is redundant but
-        # correct: if the product of GT elements is 1, then
-        # final_exponentiate(1) = 1^{(p^12-1)/r} = 1. A production
-        # implementation would use raw Miller loops for ~2x speedup.
-        #
         # py_ecc pairing signature: pairing(G2_point, G1_point)
+        # A production implementation would use raw Miller loops and a single
+        # final_exponentiate for ~3x speedup.
         result = eq(
             FQ12.one(),
             final_exponentiate(
                 pairing(B2, neg(A1)) *
-                pairing(beta_G2, alpha_G1) *
-                pairing(G2, C1)
+                pairing(srs['beta_G2'], srs['alpha_G1']) *
+                pairing(srs['gamma_G2'], X1) *
+                pairing(srs['delta_G2'], C1)
             )
         )
 
         if result:
             print(f"\n  Result: PASS -- Proof is VALID!")
             print(f"  The Prover convinced the Verifier they know a valid witness")
-            print(f"  WITHOUT revealing the witness itself. Zero knowledge achieved!")
+            print(f"  matching the declared public inputs — WITHOUT revealing the")
+            print(f"  private part. Zero knowledge achieved!")
         else:
             print(f"\n  Result: FAIL -- Proof is INVALID!")
             print(f"  The Prover could not demonstrate knowledge of a valid witness.")
@@ -867,8 +1012,9 @@ class Verifier:
 
 def main():
     print("=" * 60)
-    print("  GROTH16 PART 1")
-    print("  RareSkills Homework 11 (Week 13)")
+    print("  GROTH16 (FULL)")
+    print("  RareSkills Homework 12 (Week 13)")
+    print("  Ref: https://www.rareskills.io/post/groth16")
     print("=" * 60)
 
     # ---- Step 1: Choose R1CS ----
@@ -894,17 +1040,29 @@ def main():
     assert validate_r1cs(A, B, C, witness), "R1CS validation FAILED!"
     print("  R1CS is valid!\n")
 
-    # ---- Step 2: Choose Lagrange mode ----
-    print("  Select Lagrange interpolation mode:")
+    # ---- Step 2: UPGRADE — choose public/private witness split ----
+    # Groth16 separates "public inputs" (seen by verifier) from "private
+    # inputs" (known only to prover). The first `num_public` witness columns
+    # are public. For the default circuit, [1, out] are the natural publics.
+    print("  Select public-input count (first k witness columns are public):")
+    print(f"    Default: 2  (witness[0]=1 constant and witness[1]=out)")
+    pub_raw = input(f"  num_public [default 2, max {m_columns}]: ").strip()
+    num_public = int(pub_raw) if pub_raw else 2
+    assert 0 < num_public <= m_columns, f"num_public must be in (0, {m_columns}]"
+    print(f"  Public inputs (verifier sees):  witness[0:{num_public}] = "
+          f"{list(witness[:num_public])}")
+    print(f"  Private inputs (prover only):   witness[{num_public}:] = "
+          f"{list(witness[num_public:])}")
+
+    # ---- Step 3: Choose Lagrange mode ----
+    print("\n  Select Lagrange interpolation mode:")
     print("    1. Manual (from scratch)")
     print("    2. Library (galois)")
     lag_choice = input("  Choice [1/2]: ").strip()
 
     mode = "library" if lag_choice == "2" else "manual"
 
-    # ---- Step 3: Build QAP and run Groth16 protocol ----
-
-    # ---- QAP Construction ----
+    # ---- Step 4: Build QAP and run Groth16 protocol ----
     print(f"\n{'='*60}")
     print(f"  QAP CONSTRUCTION (Lagrange: {mode})")
     print(f"{'='*60}")
@@ -922,8 +1080,14 @@ def main():
     assert qap.verify(), "QAP polynomial verification FAILED!"
     print(f"\n  QAP VERIFIED: U(x)*V(x) = W(x) + H(x)*T(x)")
 
-    # ---- Trusted Setup Ceremony (multi-party) ----
-    ceremony = TrustedSetup(qap, participant_names=["Alice", "Bob", "Charlie"])
+    # ---- Trusted Setup Ceremony ----
+    # UPGRADE: pass num_public so the ceremony can split Psi into
+    # psi_public (divided by gamma) and psi_private (divided by delta).
+    ceremony = TrustedSetup(
+        qap,
+        num_public=num_public,
+        participant_names=["Alice", "Bob", "Charlie"],
+    )
     srs = ceremony.run_ceremony()
 
     # ---- Prover generates proof ----
@@ -931,8 +1095,12 @@ def main():
     proof = prover.generate_proof(srs)
 
     # ---- Verifier checks proof ----
+    # UPGRADE: verifier consumes only the public slice of the witness,
+    # not the whole thing. This is what makes Groth16 non-trivial — the
+    # verifier must be able to check the proof without the private inputs.
     verifier = Verifier()
-    result = verifier.verify(proof, srs)
+    public_inputs = witness[:num_public]
+    result = verifier.verify(proof, srs, public_inputs)
 
     if result:
         print(f"\n  *** GROTH16 PROOF VERIFIED SUCCESSFULLY ({mode} Lagrange) ***")
